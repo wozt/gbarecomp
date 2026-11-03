@@ -359,6 +359,20 @@ static unsigned gba_audio_pcm_frames;
 static u32 gba_audio_cycle_phase;
 static unsigned long long gba_audio_frames, gba_audio_nonzero;
 static bool gba_audio_dma_busy[4];
+/* GBA_AUDIO_DIAG_V4: opt-in MP2K/Direct Sound tracing; never alter playback. */
+static bool gba_audio_diag_enabled;
+static FILE *gba_audio_diag_wav;
+static unsigned gba_audio_diag_wav_written;
+static unsigned gba_audio_diag_period;
+static unsigned gba_audio_diag_peak;
+static unsigned gba_audio_diag_samples, gba_audio_diag_nonzero;
+static unsigned long long gba_audio_diag_underflow[2];
+static unsigned long long gba_audio_diag_previous_underflow[2];
+static unsigned long long gba_audio_diag_previous_refills[2];
+static void gba_audio_diag_init(void);
+static void gba_audio_diag_note(s16 left, s16 right);
+static void gba_audio_diag_write(const s16 *samples, unsigned frames);
+static void gba_audio_diag_finish(void);
 /* GBA_AUDIO_DECLICK_V3: ease transitions from a previously held FIFO sample,
  * especially when the game enables the mixer at the boot logos.  No ongoing
  * filtering or gain change once the short ramp finishes. */
@@ -702,6 +716,9 @@ static void gba_audio_timer_overflow(int timer) {
         int selected_timer = ch ? ((cnt_h >> 14) & 1u) : ((cnt_h >> 10) & 1u);
         if (selected_timer != timer) continue;
         GbaSoundFifo *f = &gba_sound_fifo[ch];
+        if (!f->size && gba_audio_diag_enabled && (io_regs[0x084] & 0x80u)
+            && (cnt_h & (ch ? 0x3000u : 0x0300u)))
+            gba_audio_diag_underflow[ch]++;
         f->last = f->size ? (s8)f->samples[f->head] : 0;
         if (f->size) {
             f->head = (f->head + 1) & 31u;
@@ -760,6 +777,7 @@ static void gba_audio_output_cycles(u32 cycles) {
         unsigned n = gba_audio_pcm_frames++ * 2u;
         gba_audio_pcm[n] = gba_audio_clamp(left);
         gba_audio_pcm[n + 1] = gba_audio_clamp(right);
+        gba_audio_diag_note(gba_audio_pcm[n], gba_audio_pcm[n + 1]);
         gba_audio_frames++;
         if (gba_audio_pcm_frames == GBA_AUDIO_BLOCK_FRAMES) gba_audio_flush();
     }
@@ -767,6 +785,7 @@ static void gba_audio_output_cycles(u32 cycles) {
 
 static void gba_audio_flush(void) {
     if (!gba_audio_pcm_frames) return;
+    gba_audio_diag_write(gba_audio_pcm, gba_audio_pcm_frames);
     display_audio_submit(gba_audio_pcm, gba_audio_pcm_frames);
     gba_audio_pcm_frames = 0;
 }
@@ -785,6 +804,109 @@ static void gba_audio_report(void) {
     fprintf(stderr, "[audio] declick: crossfades=%llu length=%u samples (%u ms)\n",
             gba_audio_ramps, GBA_AUDIO_DECLICK_SAMPLES,
             (unsigned)(GBA_AUDIO_DECLICK_SAMPLES * 1000u / GBA_AUDIO_HZ));
+}
+
+/* GBA_AUDIO_DIAG_V4 implementation. The captured file is the actual PCM submitted
+ * to SDL, not a re-synthesized song or a copy of the copyrighted ROM data. */
+static void gba_audio_diag_u32(FILE *f, unsigned x) {
+    unsigned char b[4] = {(unsigned char)x, (unsigned char)(x >> 8),
+                          (unsigned char)(x >> 16), (unsigned char)(x >> 24)};
+    fwrite(b, 1, 4, f);
+}
+
+static void gba_audio_diag_init(void) {
+    const char *diag = getenv("GBA_AUDIO_DIAG");
+    gba_audio_diag_enabled = diag && *diag && *diag != '0';
+    gba_audio_diag_period = 0;
+    gba_audio_diag_peak = gba_audio_diag_samples = gba_audio_diag_nonzero = 0;
+    memset(gba_audio_diag_underflow, 0, sizeof gba_audio_diag_underflow);
+    memset(gba_audio_diag_previous_underflow, 0, sizeof gba_audio_diag_previous_underflow);
+    memset(gba_audio_diag_previous_refills, 0, sizeof gba_audio_diag_previous_refills);
+    gba_audio_diag_wav_written = 0;
+    const char *wav = getenv("GBA_AUDIO_WAV");
+    if (!wav || !*wav) return;
+    gba_audio_diag_wav = fopen(wav, "wb");
+    if (!gba_audio_diag_wav) {
+        perror("[audio-diag] Cannot open WAV");
+        return;
+    }
+    fwrite("RIFF", 1, 4, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 36);
+    fwrite("WAVEfmt ", 1, 8, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 16);
+    { const unsigned char format[4] = {1, 0, 2, 0};
+      fwrite(format, 1, 4, gba_audio_diag_wav); }
+    gba_audio_diag_u32(gba_audio_diag_wav, GBA_AUDIO_HZ);
+    gba_audio_diag_u32(gba_audio_diag_wav, GBA_AUDIO_HZ * 4u);
+    { const unsigned char fmt[4] = {4, 0, 16, 0};
+      fwrite(fmt, 1, 4, gba_audio_diag_wav); }
+    fwrite("data", 1, 4, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 0);
+    fprintf(stderr, "[audio-diag] WAV capture: %s (max 20 seconds)\n", wav);
+}
+
+static void gba_audio_diag_note(s16 left, s16 right) {
+    if (!gba_audio_diag_enabled) return;
+    unsigned period = frame_count / 60u;
+    if (period != gba_audio_diag_period) {
+        fprintf(stderr,
+            "[audio-diag] frames=%u..%u mode=%02X stage=%02X "
+            "samples=%u nonzero=%u peak=%u "
+            "FIFO-A-empty=%llu refills=%llu FIFO-B-empty=%llu refills=%llu "
+            "SOUNDCNT_H=%04X X=%04X BIAS=%04X TIMER0=%04X\n",
+            gba_audio_diag_period * 60u, period * 60u,
+            ewram ? ewram[0x10] : 0, ewram ? ewram[0x11] : 0,
+            gba_audio_diag_samples, gba_audio_diag_nonzero, gba_audio_diag_peak,
+            gba_audio_diag_underflow[0] - gba_audio_diag_previous_underflow[0],
+            gba_sound_fifo[0].refills - gba_audio_diag_previous_refills[0],
+            gba_audio_diag_underflow[1] - gba_audio_diag_previous_underflow[1],
+            gba_sound_fifo[1].refills - gba_audio_diag_previous_refills[1],
+            io_read16(0x082), io_read16(0x084), io_read16(0x088),
+            timers[0].counter);
+        for (int ch = 0; ch < 2; ++ch) {
+            gba_audio_diag_previous_underflow[ch] = gba_audio_diag_underflow[ch];
+            gba_audio_diag_previous_refills[ch] = gba_sound_fifo[ch].refills;
+        }
+        gba_audio_diag_period = period;
+        gba_audio_diag_peak = gba_audio_diag_samples = gba_audio_diag_nonzero = 0;
+    }
+    int a = left < 0 ? -(int)left : (int)left;
+    int b = right < 0 ? -(int)right : (int)right;
+    unsigned peak = (unsigned)(a > b ? a : b);
+    if (peak > gba_audio_diag_peak) gba_audio_diag_peak = peak;
+    if (peak) gba_audio_diag_nonzero++;
+    gba_audio_diag_samples++;
+}
+
+static void gba_audio_diag_write(const s16 *samples, unsigned frames) {
+    if (!gba_audio_diag_wav || !frames) return;
+    const unsigned max_frames = GBA_AUDIO_HZ * 20u;
+    if (gba_audio_diag_wav_written >= max_frames) return;
+    if (frames > max_frames - gba_audio_diag_wav_written)
+        frames = max_frames - gba_audio_diag_wav_written;
+    unsigned written = (unsigned)fwrite(samples, 4, frames, gba_audio_diag_wav);
+    gba_audio_diag_wav_written += written;
+}
+
+static void gba_audio_diag_finish(void) {
+    if (gba_audio_diag_enabled)
+        fprintf(stderr,
+            "[audio-diag] final: frame=%u A-empty=%llu B-empty=%llu "
+            "A-refills=%llu B-refills=%llu\n",
+            frame_count, gba_audio_diag_underflow[0],
+            gba_audio_diag_underflow[1],
+            gba_sound_fifo[0].refills, gba_sound_fifo[1].refills);
+    if (!gba_audio_diag_wav) return;
+    unsigned bytes = gba_audio_diag_wav_written * 4u;
+    if (fseek(gba_audio_diag_wav, 4L, SEEK_SET) == 0)
+        gba_audio_diag_u32(gba_audio_diag_wav, 36u + bytes);
+    if (fseek(gba_audio_diag_wav, 40L, SEEK_SET) == 0)
+        gba_audio_diag_u32(gba_audio_diag_wav, bytes);
+    fclose(gba_audio_diag_wav);
+    gba_audio_diag_wav = NULL;
+    fprintf(stderr, "[audio-diag] WAV finalized: %u frames (%.2f s)\n",
+            gba_audio_diag_wav_written,
+            (double)gba_audio_diag_wav_written / GBA_AUDIO_HZ);
 }
 
 /* ---- Interrupt Delivery ---- */
@@ -3025,6 +3147,7 @@ void gba_init(const char* rom_path) {
     gba_audio_cycle_phase = 0;
     gba_audio_pcm_frames = 0;
     gba_audio_frames = gba_audio_nonzero = 0;
+    gba_audio_diag_init();
     gba_audio_previous_pcm[0] = gba_audio_previous_pcm[1] = 0;
     gba_audio_ramp_from[0] = gba_audio_ramp_from[1] = 0;
     gba_audio_ramp_remaining = 0;
@@ -3250,6 +3373,7 @@ int recomp_validate(u32 addr) {
 
 void gba_shutdown(void) {
     gba_audio_flush();
+    gba_audio_diag_finish();
     gba_audio_report();
     if (getenv("GBA_FUNC_TRACE")) func_ring_dump();
     if (g_validate)
