@@ -54,6 +54,23 @@ static void emit_cond_goto_or_tailcall(TranslateCtx* ctx, const char* cond, u32 
     }
 }
 
+/* GBA_SHARED_CONTROL_FLOW_V13:
+ * The ARM/Thumb assembler can BL to an internal epilogue which consumes the
+ * ORIGINAL function's stack frame. There is then no valid BL continuation;
+ * often the next ROM word is a literal-pool value with a stray 0xF8xx halfword
+ * (an orphan BL suffix). Ordinary BLs must keep call/return semantics.
+ * Require the destination to be a known local block: never guess targets. */
+static bool thumb_bl_into_shared_tail(TranslateCtx* ctx, u32 site, u32 target) {
+    if (!is_local_label(ctx, target) || target <= site ||
+        target - site >= 0x10000u) return false;
+    if (rom_read16(ctx->rom, target) >> 8 == 0xB5u) return false;
+    u32 after = site + 4u;
+    u16 a = rom_read16(ctx->rom, after);
+    u16 b = rom_read16(ctx->rom, after + 2u);
+    /* The first halfword must NOT be a BL prefix for b to be a suffix. */
+    return (b & 0xF800u) == 0xF800u && (a & 0xF800u) != 0xF000u;
+}
+
 /* ---- Output helpers ---- */
 
 static void emit(TranslateCtx* ctx, const char* fmt, ...) {
@@ -1328,8 +1345,16 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
                         snprintf(disasm_buf, sizeof(disasm_buf), "BL 0x%08X", bl_target);
                         emit_comment(ctx, "0x%08X: %s", addr, disasm_buf);
                         emit(ctx, "r[14] = 0x%08Xu; /* return address */", (addr + 4) | 1);
-                        emit(ctx, "g_ret = 0; func_%08X(); /* BL */", bl_target);
-                        emit_called(ctx, (addr + 4) | 1);
+                        if (thumb_bl_into_shared_tail(ctx, addr, bl_target)) {
+                            /* GBA_SHARED_CONTROL_FLOW_V13: the BL jumps to
+                             * an epilogue inside this same guest function;
+                             * the halfwords after it are literal data, not
+                             * a return continuation. Stay in this C frame. */
+                            emit(ctx, "goto label_%08X; /* BL into shared guest epilogue */", bl_target);
+                        } else {
+                            emit(ctx, "g_ret = 0; func_%08X(); /* BL */", bl_target);
+                            emit_called(ctx, (addr + 4) | 1);
+                        }
                         addr += 4;
                         continue;
                     }
@@ -1369,10 +1394,26 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
                 ends_in_call = (last & 0x0F000000) == 0x0B000000 || (last & 0x0F000000) == 0x0F000000;
                 into_prologue = (rom_read32(ctx->rom, block->end) & 0xFFFF0000) == 0xE92D0000;
             }
+            (void)into_prologue; /* retained for source compatibility */
             if (is_local_label(ctx, block->end))
                 emit(ctx, "goto label_%08X; /* fall through */", block->end);
-            else if (into_prologue && !ends_in_call)
-                emit(ctx, "func_%08X(); return; /* fall through into a function prologue */", block->end);
+            else if (!ends_in_call && (block->mode == CODE_THUMB || block->mode == CODE_ARM)) {
+                /* GBA_SHARED_CONTROL_FLOW_V13: all real fall-through edges
+                 * require execution of their successor, even if that block
+                 * also has a separate function entry without a PUSH prologue.
+                 * Silence here previously truncated the guest stack frame. */
+                bool known = false;
+                int lo = 0, hi = ctx->analysis->num_blocks - 1;
+                while (lo <= hi) {
+                    int mid = lo + (hi - lo) / 2;
+                    u32 a = ctx->analysis->blocks[mid].start;
+                    if (a == block->end) { known = true; break; }
+                    if (a < block->end) lo = mid + 1;
+                    else hi = mid - 1;
+                }
+                if (known)
+                    emit(ctx, "func_%08X(); return; /* shared-block fall through */", block->end);
+            }
         }
         emit_raw(ctx, "\n");
     }

@@ -1350,7 +1350,22 @@ void analysis_run(AnalysisCtx* ctx) {
                                     if ((arm_insn & 0x0F000000) == 0x0F000000) is_call = true;
                                 }
                             }
-                            if (!is_call) continue;
+                            /* GBA_SHARED_THUMB_TAIL_V13:
+                             * A no-prologue Thumb entry may be a shared epilogue
+                             * inside the caller, even when a BL into it also
+                             * made it a separate entry. Non-call B/fall-through
+                             * edges must retain that body in the caller.
+                             * Do not merge across a normal PUSH {..,LR}
+                             * prologue or far outside the enclosing body. */
+                            bool shared_thumb_body = false;
+                            if (!is_call && blk->mode == CODE_THUMB &&
+                                ctx->blocks[target_idx].mode == CODE_THUMB &&
+                                target > func->entry &&
+                                target - func->entry < 0x10000u) {
+                                u16 first = rom_read16(ctx->rom, target);
+                                shared_thumb_body = (first & 0xFF00u) != 0xB500u;
+                            }
+                            if (!is_call && !shared_thumb_body) continue;
                         }
                     }
 
