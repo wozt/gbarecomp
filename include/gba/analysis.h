@@ -58,6 +58,8 @@ typedef struct WorkItem {
 /* Main analysis context */
 typedef struct AnalysisCtx {
     const GbaRom* rom;
+    /* Exclusive ROM code boundary; defaults to the complete ROM. */
+    u32 code_end;
 
     /* Code map: one byte per ROM halfword (covers both ARM and Thumb granularity) */
     u8* codemap;            /* CodeType for each halfword in ROM */

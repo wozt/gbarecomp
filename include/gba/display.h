@@ -34,6 +34,9 @@ int display_poll_events(void);
 /* Get current GBA key state (KEYINPUT register format, active-low). */
 u16 display_get_keys(void);
 
+/* GBA_DIRECT_SOUND_FIX_V1: queued 32768-Hz stereo signed-16 PCM. */
+void display_audio_submit(const s16 *stereo_samples, unsigned frames);
+
 /* Shutdown SDL. */
 void display_shutdown(void);
 

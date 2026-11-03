@@ -20,6 +20,8 @@ typedef struct {
     /* Continuation of this function's setjmp call (0 = none): a longjmp
      * comes back there from wherever the function is, see emit_called */
     u32 setjmp_resume;
+    /* Thumb functions beginning MOV ip,lr return via BX ip. */
+    bool return_via_ip;
 } TranslateCtx;
 
 /* Create a translator context. `out` is the output file to write C code to. */

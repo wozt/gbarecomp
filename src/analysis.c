@@ -28,6 +28,11 @@ static bool addr_in_rom(const AnalysisCtx* ctx, u32 addr) {
     return (addr - GBA_ROM_START) < ctx->rom->size;
 }
 
+/* Code targets are distinct from ROM data: jump tables may be in rodata. */
+static bool addr_in_code(const AnalysisCtx* ctx, u32 addr) {
+    return addr >= GBA_ROM_START && addr < ctx->code_end;
+}
+
 static void mark_code(AnalysisCtx* ctx, u32 addr, CodeType type) {
     u32 idx = addr_to_idx(addr);
     if (idx < ctx->codemap_size) {
@@ -65,7 +70,7 @@ static void late_entry(AnalysisCtx* ctx, u32 addr, CodeType mode) {
 }
 
 static void queue_push_ex(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bool is_call, u32 parent_func) {
-    if (!addr_in_rom(ctx, addr)) return;
+    if (!addr_in_code(ctx, addr)) return;
     /* Don't queue already-visited addresses */
     if (is_visited(ctx, addr)) {
         if (is_call) late_entry(ctx, addr, mode);
@@ -176,7 +181,7 @@ static void analyze_arm_block(AnalysisCtx* ctx, u32 start, Function* func) {
     block->mode = CODE_ARM;
 
     u32 addr = start;
-    while (addr_in_rom(ctx, addr)) {
+    while (addr_in_code(ctx, addr)) {
         if (addr != start && is_visited(ctx, addr)) {
             /* Hit already-analyzed code, end block here */
             block->end = addr;
@@ -458,7 +463,7 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
     u32 bl_prefix_offset = 0;  /* Track BL prefix for two-part BL */
     bool have_bl_prefix = false;
 
-    while (addr_in_rom(ctx, addr)) {
+    while (addr_in_code(ctx, addr)) {
         if (addr != start && is_visited(ctx, addr)) {
             block->end = addr;
             block->successors[0] = addr;
@@ -658,7 +663,7 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
 /* ---- Main analysis loop ---- */
 
 static void process_work_item(AnalysisCtx* ctx, WorkItem* item) {
-    if (!addr_in_rom(ctx, item->addr)) return;
+    if (!addr_in_code(ctx, item->addr)) return;
     if (is_visited(ctx, item->addr)) {   /* became visited while queued */
         if (item->is_call) late_entry(ctx, item->addr, item->mode);
         return;
@@ -946,6 +951,20 @@ static int func_cmp(const void* a, const void* b) {
 AnalysisCtx* analysis_create(const GbaRom* rom) {
     AnalysisCtx* ctx = calloc(1, sizeof(AnalysisCtx));
     ctx->rom = rom;
+    ctx->code_end = GBA_ROM_START + rom->size;
+    const char* code_end_env = getenv("GBARECOMP_CODE_END");
+    if (code_end_env && *code_end_env) {
+        char* endptr = NULL;
+        unsigned long limit = strtoul(code_end_env, &endptr, 0);
+        if (!endptr || *endptr || limit <= GBA_ROM_START ||
+            limit > ctx->code_end || (limit & 1ul)) {
+            fprintf(stderr, "[analysis] invalid GBARECOMP_CODE_END: %s\n", code_end_env);
+            exit(EXIT_FAILURE);
+        }
+        ctx->code_end = (u32)limit;
+        fprintf(stderr, "[analysis] constrained code: 0x%08X..0x%08X (exclusive)\n",
+                GBA_ROM_START, ctx->code_end);
+    }
 
     /* Allocate codemap: one byte per halfword of ROM */
     ctx->codemap_size = rom->size / 2;
@@ -1051,7 +1070,7 @@ void analysis_run(AnalysisCtx* ctx) {
     printf("[analysis] Phase 4: Scanning for function prologues...\n");
     {
         int found = 0;
-        for (u32 offset = 0; offset + 2 <= ctx->rom->size; offset += 2) {
+        for (u32 offset = 0; offset + 2 <= ctx->code_end - GBA_ROM_START; offset += 2) {
             u32 addr = GBA_ROM_START + offset;
 
             /* Skip already-analyzed regions */
@@ -1065,7 +1084,7 @@ void analysis_run(AnalysisCtx* ctx) {
                 bool looks_valid = true;
                 for (int i = 1; i <= 3 && looks_valid; i++) {
                     u32 check_addr = addr + (u32)(i * 2);
-                    if (check_addr + 2 > GBA_ROM_START + ctx->rom->size) {
+                    if (check_addr + 2 > ctx->code_end) {
                         looks_valid = false;
                         break;
                     }
@@ -1089,7 +1108,7 @@ void analysis_run(AnalysisCtx* ctx) {
             }
 
             /* ARM function prologue: STMDB SP!, {... LR} = 0xE92Dxxxx with bit 14 set */
-            if (offset % 4 == 0 && offset + 4 <= ctx->rom->size) {
+            if (offset % 4 == 0 && offset + 4 <= ctx->code_end - GBA_ROM_START) {
                 u32 raw32 = rom_read32(ctx->rom, addr);
                 if ((raw32 & 0xFFFF0000) == 0xE92D0000 && (raw32 & (1 << 14))) {
                     queue_push(ctx, addr, CODE_ARM, 0, true);
@@ -1129,7 +1148,7 @@ void analysis_run(AnalysisCtx* ctx) {
             u32 w = rom_read32(ctx->rom, GBA_ROM_START + off);
             if (!(w & 1)) continue;
             u32 target = w & ~1u;
-            if (!addr_in_rom(ctx, target) || target < GBA_ROM_START + 4) continue;
+            if (!addr_in_code(ctx, target) || target < GBA_ROM_START + 4) continue;
             u8 kind = ctx->codemap[addr_to_idx(target)];
             if (kind == CODE_THUMB) {
                 /* Inside code already analyzed: registered after Phase 6, so

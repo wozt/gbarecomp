@@ -939,6 +939,8 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
              * ARM at the next word, and whatever runs there returns to our
              * caller, so it's a tail call. */
             emit(ctx, "func_%08X(); return; /* BX pc -> ARM */", (addr + 4) & ~3u);
+        } else if (insn->rs == 12 && ctx->return_via_ip) {
+            emit(ctx, "RECOMP_RETURN(r[12]); /* BX ip: saved LR */");
         } else {
             /* Check if this is a POP {rN}; BX rN return pattern.
              * If the previous instruction is POP {rN} where rN matches,
@@ -1264,6 +1266,8 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
 
     /* A Thumb BL to setjmp: its continuation is where a longjmp resumes */
     ctx->setjmp_resume = 0;
+    ctx->return_via_ip = (func->mode == CODE_THUMB &&
+                          rom_read16(ctx->rom, func->entry) == 0x46F4u);
     for (int b = 0; b < nblocks && !ctx->setjmp_resume; b++)
         for (int j = 0; j < ctx->analysis->num_blocks; j++) {
             const BasicBlock* bb = &ctx->analysis->blocks[j];
@@ -1470,6 +1474,32 @@ static void collect_missing_targets(const AnalysisCtx* analysis,
 }
 
 int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* outdir) {
+    /* Safety: never generate gigantic functions from misclassified ROM data.
+     * The block array is sorted at the end of analysis_run(). */
+    for (int fi = 0; fi < analysis->num_functions; fi++) {
+        const Function* func = &analysis->functions[fi];
+        unsigned long long decoded_bytes = 0;
+        for (int bi = 0; bi < func->num_blocks; bi++) {
+            u32 target = func->block_addrs[bi];
+            int lo = 0, hi = analysis->num_blocks - 1;
+            while (lo <= hi) {
+                int mid = lo + (hi - lo) / 2;
+                const BasicBlock* b = &analysis->blocks[mid];
+                if (b->start < target) lo = mid + 1;
+                else if (b->start > target) hi = mid - 1;
+                else {
+                    if (b->end > b->start) decoded_bytes += b->end - b->start;
+                    break;
+                }
+            }
+            if (decoded_bytes > 262144ull) {
+                fprintf(stderr, "[translate] refusing oversized function 0x%08X: %llu bytes of guest code; check data/code boundaries\n",
+                        func->entry, decoded_bytes);
+                return -1;
+            }
+        }
+    }
+
     MKDIR(outdir);
 
     int funcs_per_file = 100;
@@ -1984,6 +2014,10 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, ")\n\n");
         fprintf(f, "add_executable(%s ${SOURCES})\n", rom->game_code);
         fprintf(f, "target_include_directories(%s PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n\n", rom->game_code);
+        /* Math library required by the generated runtime on Unix. */
+        fprintf(f, "if(UNIX)\n");
+        fprintf(f, "    target_link_libraries(%s PRIVATE m)\n", rom->game_code);
+        fprintf(f, "endif()\n\n");
         /* SDL2 integration */
         fprintf(f, "# SDL2 display\n");
         fprintf(f, "find_package(SDL2 CONFIG QUIET)\n");

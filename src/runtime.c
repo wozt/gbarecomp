@@ -339,6 +339,35 @@ static inline void io_write32(u32 offset, u32 val) {
     io_regs[offset+3] = (u8)(val >> 24);
 }
 
+/* GBA_DIRECT_SOUND_FIX_V1: Direct Sound FIFO A/B, sample clock, SDL2 output.
+ * The GBA APU also has four PSG voices; those are NOT implemented here. */
+#define GBA_AUDIO_CPU_HZ 16777216u
+#define GBA_AUDIO_HZ 32768u
+#define GBA_AUDIO_CYCLES_PER_SAMPLE (GBA_AUDIO_CPU_HZ / GBA_AUDIO_HZ)
+#define GBA_AUDIO_BLOCK_FRAMES 512u
+
+typedef struct {
+    u8 samples[32];
+    unsigned head, size;
+    s8 last;
+    unsigned long long pops, refills, writes;
+} GbaSoundFifo;
+
+static GbaSoundFifo gba_sound_fifo[2];
+static s16 gba_audio_pcm[GBA_AUDIO_BLOCK_FRAMES * 2];
+static unsigned gba_audio_pcm_frames;
+static u32 gba_audio_cycle_phase;
+static unsigned long long gba_audio_frames, gba_audio_nonzero;
+static bool gba_audio_dma_busy[4];
+
+static bool gba_audio_is_fifo_dma(int ch, u16 control, u32 dst);
+static void gba_audio_fifo_reset(int which);
+static void gba_audio_fifo_write(u32 io_offset, u32 value, int byte_count);
+static void gba_audio_timer_overflow(int timer);
+static void gba_audio_output_cycles(u32 cycles);
+static void gba_audio_flush(void);
+static void gba_audio_report(void);
+
 /* ---- Hardware Timing ---- */
 
 static u32 cycle_counter = 0;
@@ -359,6 +388,7 @@ static u32 last_poll_cycle = 0;
 /* ---- Forward Declarations ---- */
 
 static void timer_tick(u32 cycles);
+static void dma_transfer(int channel);
 static void dma_execute(int channel);
 static void dma_trigger_vblank(void);
 static void dma_trigger_hblank(void);
@@ -393,6 +423,7 @@ static HWTimer timers[4] = {0};
 /* Timer overflow: increment counter, check for cascade/IRQ */
 static void timer_overflow(int idx) {
     timers[idx].counter = timers[idx].reload;
+    if (idx < 2) gba_audio_timer_overflow(idx);
 
     /* Fire timer IRQ if enabled */
     if (timers[idx].control & (1 << 6)) {
@@ -410,7 +441,7 @@ static void timer_overflow(int idx) {
     }
 }
 
-static void timer_tick(u32 cycles) {
+static void timer_tick_raw(u32 cycles) {
     for (int i = 0; i < 4; i++) {
         if (!timers[i].running || timers[i].cascade) continue;
 
@@ -430,6 +461,28 @@ static void timer_tick(u32 cycles) {
                 ticks = 0;
             }
         }
+    }
+}
+
+/* Advance to the next audio sample or timer overflow before continuing.
+ * This preserves FIFO playback order when a charge spans multiple ticks.
+ * Mix BEFORE each timer-overflow edge so the newly clocked FIFO sample is
+ * held for the following 32768-Hz output interval. */
+static void timer_tick(u32 cycles) {
+    while (cycles) {
+        u32 step = cycles;
+        u32 to_sample = GBA_AUDIO_CYCLES_PER_SAMPLE - gba_audio_cycle_phase;
+        if (step > to_sample) step = to_sample;
+        for (int i = 0; i < 2; ++i) {
+            if (!timers[i].running || timers[i].cascade) continue;
+            u32 prescale = 1u << timer_prescaler_shift[timers[i].prescaler];
+            u32 to_overflow = (0x10000u - timers[i].counter) * prescale
+                              - timers[i].internal_counter;
+            if (to_overflow && step > to_overflow) step = to_overflow;
+        }
+        gba_audio_output_cycles(step);
+        timer_tick_raw(step);
+        cycles -= step;
     }
 }
 
@@ -483,8 +536,10 @@ static void dma_transfer(int channel) {
         count = (channel == 3) ? 0x10000 : 0x4000;
     }
 
-    bool word = (cnt_hi >> 10) & 1;
-    int dst_ctrl = (cnt_hi >> 5) & 3;
+    bool fifo_dma = gba_audio_is_fifo_dma(channel, cnt_hi, dst);
+    if (fifo_dma) count = 4; /* FIFO DMA always transfers 16 bytes */
+    bool word = fifo_dma || ((cnt_hi >> 10) & 1);
+    int dst_ctrl = fifo_dma ? 2 : ((cnt_hi >> 5) & 3);
     int src_ctrl = (cnt_hi >> 7) & 3;
     u32 size = word ? 4 : 2;
 
@@ -520,7 +575,7 @@ static void dma_transfer(int channel) {
     /* dst_ctrl 3 = increment/reload: dst reloads on next trigger */
 
     /* Check repeat bit */
-    bool repeat = (cnt_hi >> 9) & 1;
+    bool repeat = fifo_dma || ((cnt_hi >> 9) & 1);
     int timing = (cnt_hi >> 12) & 3;
 
     if (!repeat || timing == 0) {
@@ -572,6 +627,114 @@ static void dma_trigger_hblank(void) {
             dma_transfer(ch);
         }
     }
+}
+
+/* GBA_DIRECT_SOUND_FIX_V1 implementation */
+static void gba_audio_fifo_reset(int which) {
+    GbaSoundFifo *f = &gba_sound_fifo[which];
+    f->head = 0;
+    f->size = 0;
+    f->last = 0;
+}
+
+static void gba_audio_fifo_write(u32 off, u32 value, int bytes) {
+    int which = off >= 0x0A4u ? 1 : 0;
+    GbaSoundFifo *f = &gba_sound_fifo[which];
+    for (int i = 0; i < bytes; ++i) {
+        if (f->size < 32u) {
+            f->samples[(f->head + f->size) & 31u] = (u8)(value >> (8 * i));
+            f->size++;
+        }
+        f->writes++;
+    }
+}
+
+/* FIFO DMA special timing is independent of the normal DMA word count:
+ * always exactly four 32-bit writes to FIFO A/B, destination held fixed.
+ * Source address increments unless source-control selects decrement/fixed. */
+static bool gba_audio_is_fifo_dma(int ch, u16 control, u32 dst) {
+    return (ch == 1 || ch == 2) &&
+           (control & 0x8000u) &&
+           ((control >> 12) & 3u) == 3u &&
+           ((dst & ~3u) == 0x040000A0u || (dst & ~3u) == 0x040000A4u);
+}
+
+static void gba_audio_refill(int which) {
+    u32 dst = which ? 0x040000A4u : 0x040000A0u;
+    for (int ch = 1; ch <= 2; ++ch) {
+        u16 ctrl = io_read16(DMA_CNT_H(ch));
+        if (!gba_audio_is_fifo_dma(ch, ctrl, dma_dst_latch[ch]) ||
+            (dma_dst_latch[ch] & ~3u) != dst || gba_audio_dma_busy[ch])
+            continue;
+        gba_audio_dma_busy[ch] = true;
+        dma_transfer(ch);
+        gba_audio_dma_busy[ch] = false;
+        gba_sound_fifo[which].refills++;
+    }
+}
+
+static void gba_audio_timer_overflow(int timer) {
+    u16 cnt_h = io_read16(0x082);
+    for (int ch = 0; ch < 2; ++ch) {
+        int selected_timer = ch ? ((cnt_h >> 14) & 1u) : ((cnt_h >> 10) & 1u);
+        if (selected_timer != timer) continue;
+        GbaSoundFifo *f = &gba_sound_fifo[ch];
+        f->last = f->size ? (s8)f->samples[f->head] : 0;
+        if (f->size) {
+            f->head = (f->head + 1) & 31u;
+            f->size--;
+        }
+        f->pops++;
+        if (f->size <= 16u) gba_audio_refill(ch);
+    }
+}
+
+static s16 gba_audio_clamp(int sample) {
+    if (sample > 32767) return 32767;
+    if (sample < -32768) return -32768;
+    return (s16)sample;
+}
+
+static void gba_audio_output_cycles(u32 cycles) {
+    gba_audio_cycle_phase += cycles;
+    while (gba_audio_cycle_phase >= GBA_AUDIO_CYCLES_PER_SAMPLE) {
+        gba_audio_cycle_phase -= GBA_AUDIO_CYCLES_PER_SAMPLE;
+        int left = 0, right = 0;
+        if (io_regs[0x084] & 0x80u) { /* SOUNDCNT_X master enable */
+            u16 h = io_read16(0x082);
+            for (int ch = 0; ch < 2; ++ch) {
+                const int sample = (int)gba_sound_fifo[ch].last;
+                const int gain = (h & (1u << (ch + 2))) ? 128 : 64;
+                if (h & (1u << (ch ? 13 : 9))) left += sample * gain;
+                if (h & (1u << (ch ? 12 : 8))) right += sample * gain;
+            }
+        }
+        if (left || right) gba_audio_nonzero++;
+        unsigned n = gba_audio_pcm_frames++ * 2u;
+        gba_audio_pcm[n] = gba_audio_clamp(left);
+        gba_audio_pcm[n + 1] = gba_audio_clamp(right);
+        gba_audio_frames++;
+        if (gba_audio_pcm_frames == GBA_AUDIO_BLOCK_FRAMES) gba_audio_flush();
+    }
+}
+
+static void gba_audio_flush(void) {
+    if (!gba_audio_pcm_frames) return;
+    display_audio_submit(gba_audio_pcm, gba_audio_pcm_frames);
+    gba_audio_pcm_frames = 0;
+}
+
+static void gba_audio_report(void) {
+    if (!getenv("GBA_AUDIO_STATS")) return;
+    fprintf(stderr,
+        "[audio] direct-sound: frames=%llu nonzero=%llu "
+        "FIFO-A: writes=%llu pops=%llu refills=%llu; "
+        "FIFO-B: writes=%llu pops=%llu refills=%llu; "
+        "SOUNDCNT_H=%04X SOUNDCNT_X=%04X\n",
+        gba_audio_frames, gba_audio_nonzero,
+        gba_sound_fifo[0].writes, gba_sound_fifo[0].pops, gba_sound_fifo[0].refills,
+        gba_sound_fifo[1].writes, gba_sound_fifo[1].pops, gba_sound_fifo[1].refills,
+        io_read16(0x082), io_read16(0x084));
 }
 
 /* ---- Interrupt Delivery ---- */
@@ -895,7 +1058,15 @@ void cpu_fetches(u32 n) {
 
 /* Dispatches side effects when the game writes to I/O registers. */
 static void io_write_hook(u32 offset, u32 value, int size) {
-    (void)value; (void)size;
+    (void)value;
+
+    /* SOUNDCNT_H FIFO resets are write-only, self-clearing bits. */
+    if (offset == 0x083u || (offset == 0x082u && size >= 2)) {
+        u16 soundcnt = io_read16(0x082);
+        if (soundcnt & 0x0800u) gba_audio_fifo_reset(0);
+        if (soundcnt & 0x8000u) gba_audio_fifo_reset(1);
+        io_write16(0x082, soundcnt & ~0x8800u);
+    }
 
     /* DMA control writes */
     for (int ch = 0; ch < 4; ch++) {
@@ -1162,6 +1333,10 @@ static void bus_write32_(u32 addr, u32 value) {
     case 0x03: mem_write32_raw(iwram, addr & 0x7FFF, value); break;
     case 0x04: {
         u32 off = addr & 0x3FF;
+        if (off == 0x0A0u || off == 0x0A4u) {
+            gba_audio_fifo_write(off, value, 4);
+            break;
+        }
         /* IF register: write-1-to-clear semantics */
         if (off == 0x200) {
             /* Lower 16 bits = IE (normal write), upper 16 bits = IF (write-1-to-clear) */
@@ -1204,6 +1379,10 @@ static void bus_write16_(u32 addr, u16 value) {
     case 0x03: mem_write16_raw(iwram, addr & 0x7FFF, value); break;
     case 0x04: {
         u32 off = addr & 0x3FF;
+        if (off >= 0x0A0u && off <= 0x0A6u) {
+            gba_audio_fifo_write(off, value, 2);
+            break;
+        }
         /* IF register: write-1-to-clear */
         if (off == 0x202) {
             u16 if_val = io_read16(0x202);
@@ -1241,6 +1420,10 @@ static void bus_write8_(u32 addr, u8 value) {
     case 0x03: iwram[addr & 0x7FFF] = value; break;
     case 0x04: {
         u32 off = addr & 0x3FF;
+        if (off >= 0x0A0u && off <= 0x0A7u) {
+            gba_audio_fifo_write(off, value, 1);
+            break;
+        }
         /* IF byte write: write-1-to-clear */
         if (off == 0x202 || off == 0x203) {
             u16 if_val = io_read16(0x202);
@@ -2651,7 +2834,7 @@ void cpu_undefined(u32 insn) {
 void ppu_render_scanline(void) { /* PPU is frame-based via display.c */ }
 bool ppu_in_vblank(void) { return scanline >= VISIBLE_SCANLINES; }
 bool ppu_in_hblank(void) { return scanline_cycles >= HBLANK_START_CYCLE; }
-void apu_step(u32 cycles) { (void)cycles; /* Audio stub - future work */ }
+void apu_step(u32 cycles) { gba_audio_output_cycles(cycles); }
 void dma_check(void) { /* DMAs are triggered by io_write_hook */ }
 void timer_step(u32 cycles) { timer_tick(cycles); }
 void irq_check(void) { check_interrupts(); }
@@ -2787,6 +2970,11 @@ void gba_init(const char* rom_path) {
 
     /* Initialize timer state */
     memset(timers, 0, sizeof(timers));
+    memset(gba_sound_fifo, 0, sizeof(gba_sound_fifo));
+    memset(gba_audio_dma_busy, 0, sizeof(gba_audio_dma_busy));
+    gba_audio_cycle_phase = 0;
+    gba_audio_pcm_frames = 0;
+    gba_audio_frames = gba_audio_nonzero = 0;
 
     fprintf(stderr, "[runtime] GBA static recomp runtime initialized\n");
     fprintf(stderr, "[runtime] ROM: %u bytes (%s)\n", rom_size, rom_path);
@@ -3005,6 +3193,8 @@ int recomp_validate(u32 addr) {
 }
 
 void gba_shutdown(void) {
+    gba_audio_flush();
+    gba_audio_report();
     if (getenv("GBA_FUNC_TRACE")) func_ring_dump();
     if (g_validate)
         fprintf(stderr, "validate: %d/%d functions agree (native vs interpreter)\n",
