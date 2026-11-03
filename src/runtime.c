@@ -555,6 +555,55 @@ static u32 bus_mode = BUS_ROM_CODE;
 static bool vram_burst;
 static u32 dma_dst_latch[4] = {0};
 
+/* GBA_MP2K_PCM_RING_GUARD_V5: MP2K FIFO ring protection.
+ * In Aria, the signed PCM8 ring is soundInfo+0x350, 0x630 bytes long.
+ * The jump table follows it immediately in IWRAM. When audio DMA runs
+ * beyond the end (typically at a VSync/timer boundary), those function
+ * pointers become very loud PCM samples. Only MP2K FIFO DMA is affected.
+ * GBA_MP2K_PCM_GUARD=0 disables this containment for A/B diagnosis.
+ * Proper DMA/VSync edge emulation should eventually make this unnecessary. */
+static unsigned long long gba_mp2k_pcm_ring_wraps;
+
+static u32 gba_mp2k_pcm_base(void) {
+    if (!iwram) return 0;
+    /* m4a engine pointer at 0x03007FF0. Read raw IWRAM: no bus cycles. */
+    const u8 *p = iwram + 0x7FF0;
+    u32 info = (u32)p[0] | ((u32)p[1] << 8) |
+               ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    if ((info & 0xFFFF8000u) != 0x03000000u) return 0;
+    u32 off = info & 0x7FFFu;
+    if (off > 0x8000u - 0x350u - 0x630u) return 0;
+    p = iwram + off;
+    u32 magic = (u32)p[0] | ((u32)p[1] << 8) |
+                ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    /* "Smsh" plus transient MP2K lock increments. */
+    if ((magic & 0xFFFFFF00u) != 0x68736D00u) return 0;
+    return info + 0x350u;
+}
+
+static u32 gba_mp2k_pcm_dma_wrap(u32 source, int channel) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *s = getenv("GBA_MP2K_PCM_GUARD");
+        enabled = (!s || *s != '0') ? 1 : 0;
+    }
+    if (!enabled) return source;
+    u32 base = gba_mp2k_pcm_base();
+    if (!base) return source;
+    const u32 end = base + 0x630u;
+    /* The legitimate FIFO source must be in the 0x630-byte PCM buffer.
+     * A DMA transfer of four words may cross its end. Do not touch ROM,
+     * unrelated IWRAM or other DMA channels. */
+    if (source < end || source >= end + 16u) return source;
+    u32 wrapped = base + (source - end);
+    gba_mp2k_pcm_ring_wraps++;
+    if (gba_mp2k_pcm_ring_wraps <= 6u && getenv("GBA_AUDIO_STATS"))
+        fprintf(stderr,
+                "[audio] MP2K PCM DMA channel %d crossed ring at %08X -> %08X (wrap %llu)\n",
+                channel, source, wrapped, gba_mp2k_pcm_ring_wraps);
+    return wrapped;
+}
+
 static void dma_transfer(int channel) {
     u32 base = DMA_REG_BASE + channel * 12;
     u32 src = dma_src_latch[channel];
@@ -577,6 +626,7 @@ static void dma_transfer(int channel) {
     u32 saved_mode = bus_mode;
     bus_mode = BUS_DMA;
     for (u32 i = 0; i < count; i++) {
+        if (fifo_dma) src = gba_mp2k_pcm_dma_wrap(src, channel);
         if (word) {
             u32 val = bus_read32(src);
             bus_write32(dst, val);
@@ -801,6 +851,8 @@ static void gba_audio_report(void) {
         gba_sound_fifo[0].writes, gba_sound_fifo[0].pops, gba_sound_fifo[0].refills,
         gba_sound_fifo[1].writes, gba_sound_fifo[1].pops, gba_sound_fifo[1].refills,
         io_read16(0x082), io_read16(0x084));
+    fprintf(stderr, "[audio] MP2K PCM ring wraps=%llu\n",
+            gba_mp2k_pcm_ring_wraps);
     fprintf(stderr, "[audio] declick: crossfades=%llu length=%u samples (%u ms)\n",
             gba_audio_ramps, GBA_AUDIO_DECLICK_SAMPLES,
             (unsigned)(GBA_AUDIO_DECLICK_SAMPLES * 1000u / GBA_AUDIO_HZ));
