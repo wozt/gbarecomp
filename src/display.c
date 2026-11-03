@@ -93,6 +93,86 @@ static u32 s_framebuf[GBA_WIDTH * GBA_HEIGHT];
 /* Key state: bit set = pressed. Mapped to GBA button bits. */
 static u16 s_keys_pressed = 0;
 
+/* GBA_SDL2_GAMEPAD_V1: SDL2's standard controller mapping (Xbox, Switch,
+ * PlayStation and other controllers recognized by SDL_GameController).
+ * Sample button state at GBA VBlank; keep keyboard input independent.
+ * All SDL-dependent declarations stay outside GBA_NO_SDL builds. */
+#ifndef GBA_NO_SDL
+#define GBA_GAMEPAD_AXIS_DEADZONE 11000
+#define GBA_GAMEPAD_TRIGGER_THRESHOLD 16384
+static SDL_GameController *s_gamepad;
+static SDL_JoystickID s_gamepad_instance = -1;
+
+static void gba_gamepad_close(void) {
+    if (s_gamepad) {
+        fprintf(stderr, "[gamepad] disconnected: %s\n",
+                SDL_GameControllerName(s_gamepad) ? SDL_GameControllerName(s_gamepad) : "unknown");
+        SDL_GameControllerClose(s_gamepad);
+        s_gamepad = NULL;
+    }
+    s_gamepad_instance = -1;
+}
+
+static void gba_gamepad_open(int device_index) {
+    if (s_gamepad || device_index < 0 || !SDL_IsGameController(device_index)) return;
+    SDL_GameController *candidate = SDL_GameControllerOpen(device_index);
+    if (!candidate) {
+        fprintf(stderr, "[gamepad] open failed for device %d: %s\n",
+                device_index, SDL_GetError());
+        return;
+    }
+    s_gamepad = candidate;
+    s_gamepad_instance = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(candidate));
+    fprintf(stderr, "[gamepad] connected: %s (instance=%d)\n",
+            SDL_GameControllerName(candidate) ? SDL_GameControllerName(candidate) : "unknown",
+            (int)s_gamepad_instance);
+}
+
+static void gba_gamepad_scan(void) {
+    if (s_gamepad) return;
+    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+        if (!SDL_IsGameController(i)) continue;
+        gba_gamepad_open(i);
+        if (s_gamepad) return;
+    }
+}
+
+static u16 gba_gamepad_get_keys(void) {
+    if (!s_gamepad) return 0;
+    SDL_GameControllerUpdate();
+    if (!SDL_GameControllerGetAttached(s_gamepad)) {
+        gba_gamepad_close();
+        gba_gamepad_scan();
+        if (!s_gamepad) return 0;
+    }
+    u16 keys = 0;
+#define GP_BUTTON(b) SDL_GameControllerGetButton(s_gamepad, SDL_CONTROLLER_BUTTON_##b)
+    if (GP_BUTTON(A)) keys |= (1u << 0);                /* GBA A */
+    if (GP_BUTTON(B)) keys |= (1u << 1);                /* GBA B */
+    if (GP_BUTTON(BACK)) keys |= (1u << 2);             /* GBA Select */
+    if (GP_BUTTON(START)) keys |= (1u << 3);            /* GBA Start */
+    if (GP_BUTTON(DPAD_RIGHT)) keys |= (1u << 4);
+    if (GP_BUTTON(DPAD_LEFT)) keys |= (1u << 5);
+    if (GP_BUTTON(DPAD_UP)) keys |= (1u << 6);
+    if (GP_BUTTON(DPAD_DOWN)) keys |= (1u << 7);
+    if (GP_BUTTON(RIGHTSHOULDER)) keys |= (1u << 8);    /* GBA R */
+    if (GP_BUTTON(LEFTSHOULDER)) keys |= (1u << 9);     /* GBA L */
+#undef GP_BUTTON
+    Sint16 x = SDL_GameControllerGetAxis(s_gamepad, SDL_CONTROLLER_AXIS_LEFTX);
+    Sint16 y = SDL_GameControllerGetAxis(s_gamepad, SDL_CONTROLLER_AXIS_LEFTY);
+    if (x > GBA_GAMEPAD_AXIS_DEADZONE) keys |= (1u << 4);
+    if (x < -GBA_GAMEPAD_AXIS_DEADZONE) keys |= (1u << 5);
+    if (y < -GBA_GAMEPAD_AXIS_DEADZONE) keys |= (1u << 6);
+    if (y > GBA_GAMEPAD_AXIS_DEADZONE) keys |= (1u << 7);
+    if (SDL_GameControllerGetAxis(s_gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
+            > GBA_GAMEPAD_TRIGGER_THRESHOLD) keys |= (1u << 8);
+    if (SDL_GameControllerGetAxis(s_gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)
+            > GBA_GAMEPAD_TRIGGER_THRESHOLD) keys |= (1u << 9);
+    return keys;
+}
+#endif /* !GBA_NO_SDL: gamepad */
+
+
 /* Headless mode (house style, see docs/headless.md): no window, frames go to
  * ffmpeg over a pipe so runs work over RDP and never take a screen. */
 static int   s_headless = 0;
@@ -626,6 +706,16 @@ int display_init(void) {
         return -1;
     }
 
+    /* GBA_SDL2_GAMEPAD_V1: controllers are optional; video/audio keep working. */
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
+        SDL_GameControllerEventState(SDL_ENABLE);
+        gba_gamepad_scan();
+        if (!s_gamepad && SDL_NumJoysticks() > 0)
+            fprintf(stderr, "[gamepad] no SDL2 controller mapping found; keyboard remains available\n");
+    } else {
+        fprintf(stderr, "[gamepad] SDL2 controller subsystem unavailable: %s\n", SDL_GetError());
+    }
+
     /* Audio is optional: keep the window available if ALSA/Pulse/PipeWire fails. */
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
@@ -689,6 +779,16 @@ int display_poll_events(void) {
         if (ev.type == SDL_QUIT)
             return 1;
 
+        /* SDL_CONTROLLERDEVICEADDED reports a joystick index; REMOVED an instance ID. */
+        if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+            if (!s_gamepad) gba_gamepad_open(ev.cdevice.which);
+        } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (s_gamepad && ev.cdevice.which == s_gamepad_instance) {
+                gba_gamepad_close();
+                gba_gamepad_scan();
+            }
+        }
+
         if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
             u16 bit = 0;
             switch (ev.key.keysym.sym) {
@@ -718,8 +818,13 @@ int display_poll_events(void) {
 }
 
 u16 display_get_keys(void) {
-    /* KEYINPUT is active-low: 0 = pressed, 1 = not pressed */
-    return (u16)(~s_keys_pressed) & 0x03FF;
+    /* KEYINPUT is active-low: 0 = pressed, 1 = not pressed.
+     * Do not overwrite input scripted in headless mode. */
+    u16 pressed = s_keys_pressed;
+#ifndef GBA_NO_SDL
+    if (!s_headless) pressed |= gba_gamepad_get_keys();
+#endif
+    return (u16)(~pressed) & 0x03FF;
 }
 
 void display_shutdown(void) {
@@ -727,6 +832,8 @@ void display_shutdown(void) {
     if (s_record) { pclose(s_record); s_record = NULL; }
     if (s_headless) return;
 #ifndef GBA_NO_SDL
+    /* GBA_SDL2_GAMEPAD_V1: close before SDL_Quit. */
+    gba_gamepad_close();
     if (s_audio_device) {
         if (getenv("GBA_AUDIO_STATS"))
             fprintf(stderr,
