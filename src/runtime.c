@@ -359,6 +359,23 @@ static unsigned gba_audio_pcm_frames;
 static u32 gba_audio_cycle_phase;
 static unsigned long long gba_audio_frames, gba_audio_nonzero;
 static bool gba_audio_dma_busy[4];
+/* GBA_AUDIO_DECLICK_V3: ease transitions from a previously held FIFO sample,
+ * especially when the game enables the mixer at the boot logos.  No ongoing
+ * filtering or gain change once the short ramp finishes. */
+#define GBA_AUDIO_DECLICK_SAMPLES 1024u /* 31.25 ms at 32768 Hz */
+static int gba_audio_previous_pcm[2];
+static int gba_audio_ramp_from[2];
+static unsigned gba_audio_ramp_remaining;
+static bool gba_audio_master_was_on;
+static bool gba_audio_wait_for_first_sample = true;
+static unsigned long long gba_audio_ramps;
+
+static void gba_audio_start_ramp(void) {
+    gba_audio_ramp_from[0] = gba_audio_previous_pcm[0];
+    gba_audio_ramp_from[1] = gba_audio_previous_pcm[1];
+    gba_audio_ramp_remaining = GBA_AUDIO_DECLICK_SAMPLES;
+    gba_audio_ramps++;
+}
 
 static bool gba_audio_is_fifo_dma(int ch, u16 control, u32 dst);
 static void gba_audio_fifo_reset(int which);
@@ -635,6 +652,12 @@ static void gba_audio_fifo_reset(int which) {
     f->head = 0;
     f->size = 0;
     f->last = 0;
+    /* A FIFO reset changes a sample immediately.  Crossfade the output only
+     * if it was audible; otherwise soften the next actual sound onset. */
+    if (gba_audio_previous_pcm[0] || gba_audio_previous_pcm[1])
+        gba_audio_start_ramp();
+    else
+        gba_audio_wait_for_first_sample = true;
 }
 
 static void gba_audio_fifo_write(u32 off, u32 value, int bytes) {
@@ -710,6 +733,30 @@ static void gba_audio_output_cycles(u32 cycles) {
             }
         }
         if (left || right) gba_audio_nonzero++;
+        /* Boot: SOUNDCNT_X often turns on before the first DMA data arrives.
+         * Arm the ramp only once a nonzero sample actually reaches the mixer.
+         * Master-off transitions decay instead of suddenly snapping to zero. */
+        const bool master_on = (io_regs[0x084] & 0x80u) != 0;
+        if (master_on && !gba_audio_master_was_on)
+            gba_audio_wait_for_first_sample = true;
+        if (!master_on && gba_audio_master_was_on)
+            gba_audio_start_ramp();
+        gba_audio_master_was_on = master_on;
+        if (master_on && gba_audio_wait_for_first_sample && (left || right)) {
+            gba_audio_start_ramp();
+            gba_audio_wait_for_first_sample = false;
+        }
+        if (gba_audio_ramp_remaining) {
+            const unsigned old_weight = gba_audio_ramp_remaining;
+            const unsigned new_weight = GBA_AUDIO_DECLICK_SAMPLES - old_weight;
+            left = (gba_audio_ramp_from[0] * (int)old_weight
+                  + left * (int)new_weight) / (int)GBA_AUDIO_DECLICK_SAMPLES;
+            right = (gba_audio_ramp_from[1] * (int)old_weight
+                   + right * (int)new_weight) / (int)GBA_AUDIO_DECLICK_SAMPLES;
+            gba_audio_ramp_remaining--;
+        }
+        gba_audio_previous_pcm[0] = left;
+        gba_audio_previous_pcm[1] = right;
         unsigned n = gba_audio_pcm_frames++ * 2u;
         gba_audio_pcm[n] = gba_audio_clamp(left);
         gba_audio_pcm[n + 1] = gba_audio_clamp(right);
@@ -735,6 +782,9 @@ static void gba_audio_report(void) {
         gba_sound_fifo[0].writes, gba_sound_fifo[0].pops, gba_sound_fifo[0].refills,
         gba_sound_fifo[1].writes, gba_sound_fifo[1].pops, gba_sound_fifo[1].refills,
         io_read16(0x082), io_read16(0x084));
+    fprintf(stderr, "[audio] declick: crossfades=%llu length=%u samples (%u ms)\n",
+            gba_audio_ramps, GBA_AUDIO_DECLICK_SAMPLES,
+            (unsigned)(GBA_AUDIO_DECLICK_SAMPLES * 1000u / GBA_AUDIO_HZ));
 }
 
 /* ---- Interrupt Delivery ---- */
@@ -2975,6 +3025,12 @@ void gba_init(const char* rom_path) {
     gba_audio_cycle_phase = 0;
     gba_audio_pcm_frames = 0;
     gba_audio_frames = gba_audio_nonzero = 0;
+    gba_audio_previous_pcm[0] = gba_audio_previous_pcm[1] = 0;
+    gba_audio_ramp_from[0] = gba_audio_ramp_from[1] = 0;
+    gba_audio_ramp_remaining = 0;
+    gba_audio_master_was_on = false;
+    gba_audio_wait_for_first_sample = true;
+    gba_audio_ramps = 0;
 
     fprintf(stderr, "[runtime] GBA static recomp runtime initialized\n");
     fprintf(stderr, "[runtime] ROM: %u bytes (%s)\n", rom_size, rom_path);
